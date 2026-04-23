@@ -14,26 +14,30 @@ SESSIONS = {}
 def check_subscription(user_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
 
-    r = requests.get(url, params={
-        "chat_id": CHANNEL_ID,
-        "user_id": user_id
-    }, timeout=15)
+    try:
+        r = requests.get(url, params={
+            "chat_id": CHANNEL_ID,
+            "user_id": user_id
+        }, timeout=10)
 
-    data = r.json()
+        data = r.json()
 
-    if not data.get("ok"):
+        if not data.get("ok"):
+            return False
+
+        status = data["result"]["status"]
+        return status in ["member", "administrator", "creator"]
+
+    except Exception:
         return False
-
-    status = data["result"]["status"]
-    return status in ["member", "administrator", "creator"]
 
 
 @app.route("/")
 def home():
-    return {"ok": True}
+    return {"ok": True, "message": "server is running"}
 
 
-@app.route("/auth/create-session", methods=["POST"])
+@app.route("/auth/create-session", methods=["GET", "POST"])
 def create_session():
     token = secrets.token_urlsafe(16)
 
@@ -76,9 +80,6 @@ def confirm():
     return {"ok": True}
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
