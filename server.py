@@ -44,7 +44,7 @@ def create_session():
 
     return jsonify({
         "session_token": token,
-        "bot_link": f"https://t.me/YOUR_BOT_USERNAME?start={token}"
+        "bot_link": f"https://t.me/AlterEditing_bot?start={token}"
     })
 
 
