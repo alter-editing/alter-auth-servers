@@ -3,7 +3,7 @@ import json
 import secrets
 import requests
 from datetime import datetime
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect, url_for
 
 app = Flask(__name__)
 
@@ -47,25 +47,6 @@ BANNED = load_json(BANNED_FILE, {})
 LOGS = load_json(LOGS_FILE, [])
 
 
-def now_str():
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def add_log(action, extra=None):
-    global LOGS
-    item = {
-        "time": now_str(),
-        "action": action,
-        "extra": extra or {}
-    }
-    LOGS.append(item)
-
-    if len(LOGS) > 2000:
-        LOGS = LOGS[-2000:]
-
-    save_json(LOGS_FILE, LOGS)
-
-
 def save_all():
     save_json(SESSIONS_FILE, SESSIONS)
     save_json(USERS_FILE, USERS)
@@ -73,15 +54,53 @@ def save_all():
     save_json(LOGS_FILE, LOGS)
 
 
+def now_str():
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def short_log(action, **kwargs):
+    global LOGS
+
+    item = {
+        "t": now_str(),
+        "a": action,
+    }
+
+    # короткие ключи
+    if "uid" in kwargs:
+        item["uid"] = kwargs["uid"]
+    if "u" in kwargs:
+        item["u"] = kwargs["u"]
+    if "s" in kwargs:
+        item["s"] = kwargs["s"]
+    if "ok" in kwargs:
+        item["ok"] = kwargs["ok"]
+    if "tok" in kwargs:
+        item["tok"] = kwargs["tok"]
+
+    LOGS.append(item)
+
+    if len(LOGS) > 1000:
+        LOGS = LOGS[-1000:]
+
+    save_json(LOGS_FILE, LOGS)
+
+
 def is_admin(req):
     key = req.headers.get("X-Admin-Key") or req.args.get("admin_key")
-    return bool(ADMIN_KEY) and key == ADMIN_KEY
+    return bool(ADMIN_KEY and key == ADMIN_KEY)
 
 
-def require_admin():
-    if not is_admin(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return None
+def h(text):
+    if text is None:
+        return ""
+    s = str(text)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+    )
 
 
 def check_subscription(user_id):
@@ -103,14 +122,40 @@ def check_subscription(user_id):
         data = r.json()
 
         if not data.get("ok"):
-            return False, f"telegram_error: {data}"
+            return False, f"telegram_error"
 
         status = data["result"]["status"]
         authorized = status in ["member", "administrator", "creator"]
         return authorized, status
 
-    except Exception as e:
-        return False, f"exception: {e}"
+    except Exception:
+        return False, "exception"
+
+
+def invalidate_user_sessions(user_id, status_value="banned"):
+    user_id_str = str(user_id)
+    for token in list(SESSIONS.keys()):
+        if str(SESSIONS[token].get("telegram_user_id")) == user_id_str:
+            SESSIONS[token]["authorized"] = False
+            SESSIONS[token]["status"] = status_value
+
+
+def get_stats():
+    total_users = len(USERS)
+    total_banned = len(BANNED)
+
+    active_ok = 0
+    for user in USERS.values():
+        st = user.get("last_status")
+        if st in ["member", "administrator", "creator"]:
+            active_ok += 1
+
+    return {
+        "total_users": total_users,
+        "active_ok": active_ok,
+        "banned_count": total_banned,
+        "total_logs": len(LOGS),
+    }
 
 
 @app.route("/")
@@ -130,9 +175,7 @@ def create_session():
     }
     save_json(SESSIONS_FILE, SESSIONS)
 
-    add_log("create_session", {
-        "session_token": token
-    })
+    short_log("create", tok=token[:8])
 
     return jsonify({
         "session_token": token,
@@ -169,10 +212,7 @@ def bot_confirm():
     first_name = data.get("first_name")
 
     if not token or token not in SESSIONS:
-        add_log("bot_confirm_invalid_session", {
-            "session_token": token,
-            "telegram_user_id": user_id
-        })
+        short_log("bad_session", uid=user_id, tok=(token or "")[:8])
         return jsonify({
             "ok": False,
             "authorized": False,
@@ -180,9 +220,7 @@ def bot_confirm():
         }), 400
 
     if not user_id:
-        add_log("bot_confirm_missing_user_id", {
-            "session_token": token
-        })
+        short_log("no_uid", tok=token[:8])
         return jsonify({
             "ok": False,
             "authorized": False,
@@ -207,10 +245,7 @@ def bot_confirm():
         }
 
         save_all()
-        add_log("bot_confirm_banned", {
-            "telegram_user_id": user_id,
-            "username": username
-        })
+        short_log("banned_try", uid=user_id, u=username, s="banned", ok=False)
 
         return jsonify({
             "ok": True,
@@ -235,13 +270,7 @@ def bot_confirm():
     }
 
     save_all()
-
-    add_log("bot_confirm", {
-        "telegram_user_id": user_id,
-        "username": username,
-        "authorized": authorized,
-        "status": status_info
-    })
+    short_log("confirm", uid=user_id, u=username, s=status_info, ok=authorized)
 
     return jsonify({
         "ok": True,
@@ -251,54 +280,66 @@ def bot_confirm():
 
 
 # -----------------------------
-# ADMIN API
+# ADMIN JSON API
 # -----------------------------
+
+@app.route("/admin/stats", methods=["GET"])
+def admin_stats():
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    return jsonify({
+        "ok": True,
+        "stats": get_stats()
+    })
+
 
 @app.route("/admin/users", methods=["GET"])
 def admin_users():
-    denied = require_admin()
-    if denied:
-        return denied
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    user_list = list(USERS.values())
-    user_list.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
+    users = sorted(
+        USERS.values(),
+        key=lambda x: x.get("last_seen", ""),
+        reverse=True
+    )
 
     return jsonify({
         "ok": True,
-        "users": user_list,
-        "banned": BANNED
+        "users": users,
+        "stats": get_stats()
     })
 
 
 @app.route("/admin/logs", methods=["GET"])
 def admin_logs():
-    denied = require_admin()
-    if denied:
-        return denied
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     return jsonify({
         "ok": True,
-        "logs": LOGS[-300:]
+        "logs": LOGS[-200:],
+        "stats": get_stats()
     })
 
 
 @app.route("/admin/banned", methods=["GET"])
 def admin_banned():
-    denied = require_admin()
-    if denied:
-        return denied
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     return jsonify({
         "ok": True,
-        "banned": BANNED
+        "banned": BANNED,
+        "stats": get_stats()
     })
 
 
 @app.route("/admin/ban", methods=["POST"])
 def admin_ban():
-    denied = require_admin()
-    if denied:
-        return denied
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     data = request.json or {}
     user_id = data.get("telegram_user_id")
@@ -312,17 +353,17 @@ def admin_ban():
         "banned_at": now_str()
     }
 
-    save_json(BANNED_FILE, BANNED)
-    add_log("admin_ban", {"telegram_user_id": user_id})
+    invalidate_user_sessions(user_id, "banned")
+    save_all()
+    short_log("ban", uid=user_id)
 
     return jsonify({"ok": True})
 
 
 @app.route("/admin/unban", methods=["POST"])
 def admin_unban():
-    denied = require_admin()
-    if denied:
-        return denied
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     data = request.json or {}
     user_id = data.get("telegram_user_id")
@@ -335,16 +376,15 @@ def admin_unban():
         del BANNED[user_id_str]
 
     save_json(BANNED_FILE, BANNED)
-    add_log("admin_unban", {"telegram_user_id": user_id})
+    short_log("unban", uid=user_id)
 
     return jsonify({"ok": True})
 
 
 @app.route("/admin/reset-user", methods=["POST"])
 def admin_reset_user():
-    denied = require_admin()
-    if denied:
-        return denied
+    if not is_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     data = request.json or {}
     user_id = data.get("telegram_user_id")
@@ -357,364 +397,447 @@ def admin_reset_user():
     if user_id_str in USERS:
         del USERS[user_id_str]
 
-    for token in list(SESSIONS.keys()):
-        if str(SESSIONS[token].get("telegram_user_id")) == user_id_str:
-            SESSIONS[token]["authorized"] = False
-            SESSIONS[token]["status"] = "reset_by_admin"
-
+    invalidate_user_sessions(user_id, "reset_by_admin")
     save_all()
-    add_log("admin_reset_user", {"telegram_user_id": user_id})
+    short_log("reset", uid=user_id)
 
     return jsonify({"ok": True})
 
 
 # -----------------------------
-# HTML ADMIN PANEL
+# ADMIN HTML
 # -----------------------------
 
-@app.route("/admin", methods=["GET"])
-def admin_panel():
-    denied = require_admin()
-    if denied:
-        return denied
-
-    html = f"""
-<!DOCTYPE html>
-<html lang="ru">
+def panel_layout(title, body_html):
+    return f"""
+<!doctype html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>AlterEditing Admin</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        * {{
-            box-sizing: border-box;
-            font-family: Arial, sans-serif;
-        }}
-        body {{
-            margin: 0;
-            background: #0d0f14;
-            color: #fff;
-        }}
-        .wrap {{
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 24px;
-        }}
-        h1 {{
-            margin: 0 0 18px;
-            font-size: 28px;
-        }}
-        .topbar {{
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-            margin-bottom: 20px;
-        }}
-        .btn {{
-            background: #1e2533;
-            color: #fff;
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 12px;
-            padding: 10px 14px;
-            cursor: pointer;
-        }}
-        .btn:hover {{
-            background: #273146;
-        }}
-        .grid {{
-            display: grid;
-            grid-template-columns: 1.2fr 1fr;
-            gap: 20px;
-        }}
-        .card {{
-            background: #121723;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 18px;
-            padding: 18px;
-            box-shadow: 0 6px 24px rgba(0,0,0,0.25);
-        }}
-        .card h2 {{
-            margin-top: 0;
-            font-size: 20px;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-        }}
-        th, td {{
-            text-align: left;
-            padding: 10px 8px;
-            border-bottom: 1px solid rgba(255,255,255,0.08);
-            vertical-align: top;
-            font-size: 14px;
-        }}
-        th {{
-            color: #9fb2d9;
-            font-weight: 600;
-        }}
-        .tag {{
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 999px;
-            font-size: 12px;
-            background: rgba(255,255,255,0.08);
-        }}
-        .tag.green {{ background: rgba(46, 160, 67, 0.18); color: #72e28d; }}
-        .tag.red {{ background: rgba(248, 81, 73, 0.18); color: #ff8f87; }}
-        .tag.yellow {{ background: rgba(210, 153, 34, 0.18); color: #f0c674; }}
-        .actions {{
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }}
-        .small-btn {{
-            border: 0;
-            border-radius: 10px;
-            padding: 8px 10px;
-            cursor: pointer;
-            color: white;
-            font-size: 13px;
-        }}
-        .ban {{ background: #8a2632; }}
-        .unban {{ background: #1f6f43; }}
-        .reset {{ background: #825d1a; }}
-        .log-box {{
-            max-height: 750px;
-            overflow: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }}
-        .log-item {{
-            background: #0d1220;
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: 12px;
-            padding: 10px 12px;
-            font-size: 13px;
-        }}
-        .muted {{
-            color: #9fa8bb;
-        }}
-        .mono {{
-            font-family: Consolas, monospace;
-            word-break: break-word;
-        }}
-        .status {{
-            margin-bottom: 12px;
-            color: #9fb2d9;
-            font-size: 13px;
-        }}
-        .empty {{
-            color: #8e97aa;
-            padding: 12px 0;
-        }}
-        @media (max-width: 1050px) {{
-            .grid {{
-                grid-template-columns: 1fr;
-            }}
-        }}
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{h(title)}</title>
+<style>
+    body {{
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #0b0f17;
+        color: #f2f4f8;
+    }}
+    .wrap {{
+        max-width: 1250px;
+        margin: 0 auto;
+        padding: 22px;
+    }}
+    h1 {{
+        margin: 0 0 16px 0;
+        font-size: 30px;
+    }}
+    .topbar {{
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 18px;
+    }}
+    .btn {{
+        display: inline-block;
+        padding: 10px 14px;
+        border-radius: 10px;
+        background: #131a27;
+        color: white;
+        text-decoration: none;
+        border: 1px solid #253047;
+    }}
+    .btn:hover {{
+        background: #182133;
+    }}
+    .grid {{
+        display: grid;
+        grid-template-columns: repeat(4, minmax(180px, 1fr));
+        gap: 12px;
+        margin-bottom: 18px;
+    }}
+    .stat {{
+        background: #121826;
+        border: 1px solid #243048;
+        border-radius: 14px;
+        padding: 14px;
+    }}
+    .stat .label {{
+        color: #9cadc8;
+        font-size: 12px;
+        margin-bottom: 8px;
+    }}
+    .stat .value {{
+        font-size: 24px;
+        font-weight: 700;
+    }}
+    .card {{
+        background: #121826;
+        border: 1px solid #243048;
+        border-radius: 16px;
+        padding: 16px;
+        margin-bottom: 18px;
+    }}
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+    }}
+    th, td {{
+        text-align: left;
+        padding: 12px;
+        border-bottom: 1px solid #233046;
+        vertical-align: top;
+        font-size: 14px;
+    }}
+    th {{
+        color: #c3d0e7;
+        background: #151d2c;
+    }}
+    tr:hover td {{
+        background: #151c29;
+    }}
+    .muted {{
+        color: #97a7c0;
+    }}
+    .status {{
+        display: inline-block;
+        padding: 5px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        border: 1px solid #2b3750;
+        background: #0e1420;
+    }}
+    .member, .creator, .administrator {{
+        color: #9cf0b8;
+        border-color: #27553a;
+    }}
+    .left, .banned, .reset_by_admin {{
+        color: #ffb3b3;
+        border-color: #5b2929;
+    }}
+    .created {{
+        color: #ffd28a;
+        border-color: #5d4921;
+    }}
+    .mono {{
+        font-family: Consolas, monospace;
+        word-break: break-word;
+    }}
+    .actions {{
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+    }}
+    form {{
+        margin: 0;
+    }}
+    button {{
+        cursor: pointer;
+        border: 1px solid #2e3a54;
+        background: #182133;
+        color: white;
+        padding: 8px 12px;
+        border-radius: 10px;
+    }}
+    button:hover {{
+        background: #202a3f;
+    }}
+    .danger {{
+        border-color: #703131;
+        background: #2a1717;
+    }}
+    .danger:hover {{
+        background: #351d1d;
+    }}
+    .good {{
+        border-color: #2d5e40;
+        background: #15241a;
+    }}
+    .good:hover {{
+        background: #1d3023;
+    }}
+    .small {{
+        font-size: 12px;
+    }}
+</style>
 </head>
 <body>
-    <div class="wrap">
-        <h1>AlterEditing Admin Console</h1>
-
-        <div class="topbar">
-            <button class="btn" onclick="reloadAll()">Refresh</button>
-            <button class="btn" onclick="reloadUsers()">Refresh Users</button>
-            <button class="btn" onclick="reloadLogs()">Refresh Logs</button>
-        </div>
-
-        <div class="grid">
-            <div class="card">
-                <h2>Users</h2>
-                <div class="status" id="usersStatus">Loading users...</div>
-                <div style="overflow:auto;">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Username</th>
-                                <th>Name</th>
-                                <th>Status</th>
-                                <th>Seen</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="usersTable"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Logs</h2>
-                <div class="status" id="logsStatus">Loading logs...</div>
-                <div class="log-box" id="logsBox"></div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const ADMIN_KEY = new URLSearchParams(window.location.search).get("admin_key");
-
-        function esc(v) {{
-            if (v === null || v === undefined) return "";
-            return String(v)
-                .replaceAll("&", "&amp;")
-                .replaceAll("<", "&lt;")
-                .replaceAll(">", "&gt;")
-                .replaceAll('"', "&quot;");
-        }}
-
-        function statusBadge(status, isBanned) {{
-            if (isBanned || status === "banned") {{
-                return '<span class="tag red">banned</span>';
-            }}
-            if (status === "member" || status === "administrator" || status === "creator") {{
-                return '<span class="tag green">' + esc(status) + '</span>';
-            }}
-            if (status) {{
-                return '<span class="tag yellow">' + esc(status) + '</span>';
-            }}
-            return '<span class="tag">unknown</span>';
-        }}
-
-        async function apiGet(url) {{
-            const r = await fetch(url);
-            return await r.json();
-        }}
-
-        async function apiPost(url, body) {{
-            const r = await fetch(url, {{
-                method: "POST",
-                headers: {{
-                    "Content-Type": "application/json",
-                    "X-Admin-Key": ADMIN_KEY || ""
-                }},
-                body: JSON.stringify(body || {{}})
-            }});
-            return await r.json();
-        }}
-
-        async function reloadUsers() {{
-            document.getElementById("usersStatus").innerText = "Loading users...";
-
-            const data = await apiGet(`/admin/users?admin_key=${{encodeURIComponent(ADMIN_KEY || "")}}`);
-            const tbody = document.getElementById("usersTable");
-            tbody.innerHTML = "";
-
-            if (!data.ok) {{
-                document.getElementById("usersStatus").innerText = "Failed to load users.";
-                return;
-            }}
-
-            const banned = data.banned || {{}};
-            const users = data.users || [];
-
-            document.getElementById("usersStatus").innerText = `Users: ${{users.length}}`;
-
-            if (!users.length) {{
-                tbody.innerHTML = `<tr><td colspan="6" class="empty">No users yet.</td></tr>`;
-                return;
-            }}
-
-            for (const user of users) {{
-                const id = user.telegram_user_id;
-                const isBanned = !!banned[String(id)];
-
-                const tr = document.createElement("tr");
-                tr.innerHTML = `
-                    <td class="mono">${{esc(id)}}</td>
-                    <td>${{esc(user.username || "")}}</td>
-                    <td>${{esc(user.first_name || "")}}</td>
-                    <td>${{statusBadge(user.last_status, isBanned)}}</td>
-                    <td class="mono">${{esc(user.last_seen || "")}}</td>
-                    <td>
-                        <div class="actions">
-                            <button class="small-btn ban" onclick="banUser('${{esc(id)}}')">Ban</button>
-                            <button class="small-btn unban" onclick="unbanUser('${{esc(id)}}')">Unban</button>
-                            <button class="small-btn reset" onclick="resetUser('${{esc(id)}}')">Reset</button>
-                        </div>
-                    </td>
-                `;
-                tbody.appendChild(tr);
-            }}
-        }}
-
-        async function reloadLogs() {{
-            document.getElementById("logsStatus").innerText = "Loading logs...";
-
-            const data = await apiGet(`/admin/logs?admin_key=${{encodeURIComponent(ADMIN_KEY || "")}}`);
-            const box = document.getElementById("logsBox");
-            box.innerHTML = "";
-
-            if (!data.ok) {{
-                document.getElementById("logsStatus").innerText = "Failed to load logs.";
-                return;
-            }}
-
-            const logs = data.logs || [];
-            document.getElementById("logsStatus").innerText = `Logs: ${{logs.length}}`;
-
-            if (!logs.length) {{
-                box.innerHTML = `<div class="empty">No logs yet.</div>`;
-                return;
-            }}
-
-            const reversed = [...logs].reverse();
-            for (const log of reversed) {{
-                const div = document.createElement("div");
-                div.className = "log-item";
-                div.innerHTML = `
-                    <div><strong>${{esc(log.action)}}</strong></div>
-                    <div class="muted mono">${{esc(log.time)}}</div>
-                    <div class="mono">${{esc(JSON.stringify(log.extra || {{}}, null, 2))}}</div>
-                `;
-                box.appendChild(div);
-            }}
-        }}
-
-        async function banUser(userId) {{
-            if (!confirm(`Ban user ${{userId}}?`)) return;
-            const data = await apiPost("/admin/ban", {{ telegram_user_id: userId }});
-            if (data.ok) {{
-                await reloadAll();
-            }} else {{
-                alert("Ban failed: " + JSON.stringify(data));
-            }}
-        }}
-
-        async function unbanUser(userId) {{
-            if (!confirm(`Unban user ${{userId}}?`)) return;
-            const data = await apiPost("/admin/unban", {{ telegram_user_id: userId }});
-            if (data.ok) {{
-                await reloadAll();
-            }} else {{
-                alert("Unban failed: " + JSON.stringify(data));
-            }}
-        }}
-
-        async function resetUser(userId) {{
-            if (!confirm(`Reset user ${{userId}}?`)) return;
-            const data = await apiPost("/admin/reset-user", {{ telegram_user_id: userId }});
-            if (data.ok) {{
-                await reloadAll();
-            }} else {{
-                alert("Reset failed: " + JSON.stringify(data));
-            }}
-        }}
-
-        async function reloadAll() {{
-            await reloadUsers();
-            await reloadLogs();
-        }}
-
-        reloadAll();
-    </script>
+<div class="wrap">
+{body_html}
+</div>
 </body>
 </html>
 """
-    return Response(html, mimetype="text/html")
+
+
+def render_stats(stats):
+    return f"""
+    <div class="grid">
+        <div class="stat">
+            <div class="label">Всего пользователей</div>
+            <div class="value">{stats["total_users"]}</div>
+        </div>
+        <div class="stat">
+            <div class="label">Активных / подтверждённых</div>
+            <div class="value">{stats["active_ok"]}</div>
+        </div>
+        <div class="stat">
+            <div class="label">Забанено</div>
+            <div class="value">{stats["banned_count"]}</div>
+        </div>
+        <div class="stat">
+            <div class="label">Всего логов</div>
+            <div class="value">{stats["total_logs"]}</div>
+        </div>
+    </div>
+    """
+
+
+@app.route("/admin/panel", methods=["GET"])
+def admin_panel():
+    if not is_admin(request):
+        return Response("Unauthorized", status=401)
+
+    admin_key = request.args.get("admin_key", "")
+    stats = get_stats()
+    users = sorted(
+        USERS.values(),
+        key=lambda x: x.get("last_seen", ""),
+        reverse=True
+    )
+
+    rows = []
+    for user in users:
+        user_id = user.get("telegram_user_id")
+        username = user.get("username") or ""
+        first_name = user.get("first_name") or ""
+        last_status = user.get("last_status") or "unknown"
+        last_seen = user.get("last_seen") or ""
+        banned = str(user_id) in BANNED
+
+        rows.append(f"""
+        <tr>
+            <td class="mono">{h(user_id)}</td>
+            <td>{('@' + h(username)) if username else '<span class="muted">-</span>'}</td>
+            <td>{h(first_name) if first_name else '<span class="muted">-</span>'}</td>
+            <td><span class="status {h(last_status)}">{h(last_status)}</span></td>
+            <td class="small">{h(last_seen)}</td>
+            <td>{'<span class="status banned">banned</span>' if banned else '<span class="status">active</span>'}</td>
+            <td>
+                <div class="actions">
+                    <form method="post" action="/admin/panel/ban?admin_key={h(admin_key)}">
+                        <input type="hidden" name="telegram_user_id" value="{h(user_id)}">
+                        <button class="danger" type="submit">Ban</button>
+                    </form>
+                    <form method="post" action="/admin/panel/unban?admin_key={h(admin_key)}">
+                        <input type="hidden" name="telegram_user_id" value="{h(user_id)}">
+                        <button class="good" type="submit">Unban</button>
+                    </form>
+                    <form method="post" action="/admin/panel/reset-user?admin_key={h(admin_key)}">
+                        <input type="hidden" name="telegram_user_id" value="{h(user_id)}">
+                        <button type="submit">Reset</button>
+                    </form>
+                </div>
+            </td>
+        </tr>
+        """)
+
+    body = f"""
+    <h1>Admin Panel</h1>
+    <div class="topbar">
+        <a class="btn" href="/admin/panel?admin_key={h(admin_key)}">Users</a>
+        <a class="btn" href="/admin/logs-page?admin_key={h(admin_key)}">Logs</a>
+        <a class="btn" href="/admin/banned-page?admin_key={h(admin_key)}">Banned</a>
+    </div>
+
+    {render_stats(stats)}
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Telegram ID</th>
+                    <th>Username</th>
+                    <th>First name</th>
+                    <th>Status</th>
+                    <th>Last seen</th>
+                    <th>Access</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows) if rows else '<tr><td colspan="7" class="muted">No users yet</td></tr>'}
+            </tbody>
+        </table>
+    </div>
+    """
+    return panel_layout("Admin Panel", body)
+
+
+@app.route("/admin/logs-page", methods=["GET"])
+def admin_logs_page():
+    if not is_admin(request):
+        return Response("Unauthorized", status=401)
+
+    admin_key = request.args.get("admin_key", "")
+    stats = get_stats()
+    logs = LOGS[-200:][::-1]
+
+    rows = []
+    for item in logs:
+        rows.append(f"""
+        <tr>
+            <td class="small">{h(item.get("t"))}</td>
+            <td>{h(item.get("a"))}</td>
+            <td class="mono">{h(item.get("uid", ""))}</td>
+            <td>{h(item.get("u", ""))}</td>
+            <td>{h(item.get("s", ""))}</td>
+            <td>{h(item.get("ok", ""))}</td>
+            <td class="mono small">{h(item.get("tok", ""))}</td>
+        </tr>
+        """)
+
+    body = f"""
+    <h1>Logs</h1>
+    <div class="topbar">
+        <a class="btn" href="/admin/panel?admin_key={h(admin_key)}">Users</a>
+        <a class="btn" href="/admin/logs-page?admin_key={h(admin_key)}">Logs</a>
+        <a class="btn" href="/admin/banned-page?admin_key={h(admin_key)}">Banned</a>
+    </div>
+
+    {render_stats(stats)}
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Action</th>
+                    <th>User ID</th>
+                    <th>Username</th>
+                    <th>Status</th>
+                    <th>OK</th>
+                    <th>Token</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows) if rows else '<tr><td colspan="7" class="muted">No logs yet</td></tr>'}
+            </tbody>
+        </table>
+    </div>
+    """
+    return panel_layout("Logs", body)
+
+
+@app.route("/admin/banned-page", methods=["GET"])
+def admin_banned_page():
+    if not is_admin(request):
+        return Response("Unauthorized", status=401)
+
+    admin_key = request.args.get("admin_key", "")
+    stats = get_stats()
+    rows = []
+
+    for user_id, data in BANNED.items():
+        rows.append(f"""
+        <tr>
+            <td class="mono">{h(user_id)}</td>
+            <td class="small">{h(data.get("banned_at"))}</td>
+            <td>
+                <form method="post" action="/admin/panel/unban?admin_key={h(admin_key)}">
+                    <input type="hidden" name="telegram_user_id" value="{h(user_id)}">
+                    <button class="good" type="submit">Unban</button>
+                </form>
+            </td>
+        </tr>
+        """)
+
+    body = f"""
+    <h1>Banned Users</h1>
+    <div class="topbar">
+        <a class="btn" href="/admin/panel?admin_key={h(admin_key)}">Users</a>
+        <a class="btn" href="/admin/logs-page?admin_key={h(admin_key)}">Logs</a>
+        <a class="btn" href="/admin/banned-page?admin_key={h(admin_key)}">Banned</a>
+    </div>
+
+    {render_stats(stats)}
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Telegram ID</th>
+                    <th>Banned at</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows) if rows else '<tr><td colspan="3" class="muted">No banned users</td></tr>'}
+            </tbody>
+        </table>
+    </div>
+    """
+    return panel_layout("Banned Users", body)
+
+
+@app.route("/admin/panel/ban", methods=["POST"])
+def admin_panel_ban():
+    if not is_admin(request):
+        return Response("Unauthorized", status=401)
+
+    admin_key = request.args.get("admin_key", "")
+    user_id = request.form.get("telegram_user_id")
+
+    if user_id:
+        user_id_str = str(user_id)
+        BANNED[user_id_str] = {
+            "telegram_user_id": user_id,
+            "banned_at": now_str()
+        }
+        invalidate_user_sessions(user_id, "banned")
+        save_all()
+        short_log("ban", uid=user_id)
+
+    return redirect(url_for("admin_panel", admin_key=admin_key))
+
+
+@app.route("/admin/panel/unban", methods=["POST"])
+def admin_panel_unban():
+    if not is_admin(request):
+        return Response("Unauthorized", status=401)
+
+    admin_key = request.args.get("admin_key", "")
+    user_id = request.form.get("telegram_user_id")
+
+    if user_id:
+        user_id_str = str(user_id)
+        if user_id_str in BANNED:
+            del BANNED[user_id_str]
+            save_json(BANNED_FILE, BANNED)
+            short_log("unban", uid=user_id)
+
+    return redirect(url_for("admin_panel", admin_key=admin_key))
+
+
+@app.route("/admin/panel/reset-user", methods=["POST"])
+def admin_panel_reset_user():
+    if not is_admin(request):
+        return Response("Unauthorized", status=401)
+
+    admin_key = request.args.get("admin_key", "")
+    user_id = request.form.get("telegram_user_id")
+
+    if user_id:
+        user_id_str = str(user_id)
+
+        if user_id_str in USERS:
+            del USERS[user_id_str]
+
+        invalidate_user_sessions(user_id, "reset_by_admin")
+        save_all()
+        short_log("reset", uid=user_id)
+
+    return redirect(url_for("admin_panel", admin_key=admin_key))
 
 
 if __name__ == "__main__":
