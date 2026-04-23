@@ -17,7 +17,7 @@ def check_subscription(user_id):
     r = requests.get(url, params={
         "chat_id": CHANNEL_ID,
         "user_id": user_id
-    })
+    }, timeout=15)
 
     data = r.json()
 
@@ -25,7 +25,6 @@ def check_subscription(user_id):
         return False
 
     status = data["result"]["status"]
-    "bot_link": f"https://t.me/AlterEditing_bot?start={token}"
     return status in ["member", "administrator", "creator"]
 
 
@@ -44,7 +43,7 @@ def create_session():
 
     return jsonify({
         "session_token": token,
-
+        "bot_link": f"https://t.me/AlterEditing_bot?start={token}"
     })
 
 
@@ -60,12 +59,15 @@ def status(token):
 
 @app.route("/auth/bot-confirm", methods=["POST"])
 def confirm():
-    data = request.json
+    data = request.json or {}
 
     token = data.get("session_token")
     user_id = data.get("telegram_user_id")
 
-    if token not in SESSIONS:
+    if not token or token not in SESSIONS:
+        return {"ok": False}
+
+    if not user_id:
         return {"ok": False}
 
     if check_subscription(user_id):
@@ -74,6 +76,9 @@ def confirm():
     return {"ok": True}
 
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
