@@ -25,7 +25,7 @@ def check_subscription(user_id):
         return False
 
     status = data["result"]["status"]
-
+    "bot_link": f"https://t.me/AlterEditing_bot?start={token}"
     return status in ["member", "administrator", "creator"]
 
 
