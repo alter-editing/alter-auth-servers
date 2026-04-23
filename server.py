@@ -1,7 +1,7 @@
 import os
-from flask import Flask, request, jsonify
-import requests
 import secrets
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -11,7 +11,11 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 SESSIONS = {}
 
 
+# 🔹 Проверка подписки
 def check_subscription(user_id):
+    if not BOT_TOKEN or not CHANNEL_ID:
+        return False
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
 
     try:
@@ -26,17 +30,20 @@ def check_subscription(user_id):
             return False
 
         status = data["result"]["status"]
+
         return status in ["member", "administrator", "creator"]
 
-    except Exception:
+    except:
         return False
 
 
+# 🔹 Проверка работы сервера
 @app.route("/")
 def home():
-    return {"ok": True, "message": "server is running"}
+    return {"ok": True}
 
 
+# 🔹 Создание сессии (GET + POST)
 @app.route("/auth/create-session", methods=["GET", "POST"])
 def create_session():
     token = secrets.token_urlsafe(16)
@@ -51,6 +58,7 @@ def create_session():
     })
 
 
+# 🔹 Проверка статуса
 @app.route("/auth/status/<token>")
 def status(token):
     session = SESSIONS.get(token)
@@ -61,6 +69,7 @@ def status(token):
     return {"authorized": session["authorized"]}
 
 
+# 🔹 Подтверждение от бота
 @app.route("/auth/bot-confirm", methods=["POST"])
 def confirm():
     data = request.json or {}
@@ -80,6 +89,7 @@ def confirm():
     return {"ok": True}
 
 
+# 🔹 Запуск (ВАЖНО ДЛЯ RENDER)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
